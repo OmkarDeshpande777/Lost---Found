@@ -1,0 +1,431 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Face Recognition System - GPU Accelerated</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(45deg, #FF6B6B, #4ECDC4);
+            color: white;
+            text-align: center;
+            padding: 40px 20px;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .gpu-badge {
+            display: inline-block;
+            background: rgba(255,255,255,0.2);
+            padding: 8px 16px;
+            border-radius: 25px;
+            margin-top: 10px;
+            font-size: 0.9em;
+        }
+        
+        .content {
+            padding: 40px;
+        }
+        
+        .section {
+            margin-bottom: 40px;
+            padding: 30px;
+            border: 2px solid #f0f0f0;
+            border-radius: 10px;
+            background: #fafafa;
+        }
+        
+        .section h2 {
+            color: #333;
+            margin-bottom: 20px;
+            font-size: 1.5em;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #555;
+        }
+        
+        input[type="text"], input[type="file"] {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
+        }
+        
+        input[type="text"]:focus, input[type="file"]:focus {
+            outline: none;
+            border-color: #4ECDC4;
+        }
+        
+        .btn {
+            background: linear-gradient(45deg, #FF6B6B, #4ECDC4);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+            width: 100%;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+        }
+        
+        .btn:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 8px;
+            display: none;
+        }
+        
+        .result.success {
+            background: #d4edda;
+            border: 1px solid #c3e6cb;
+            color: #155724;
+        }
+        
+        .result.error {
+            background: #f8d7da;
+            border: 1px solid #f5c6cb;
+            color: #721c24;
+        }
+        
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 20px;
+        }
+        
+        .spinner {
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #4ECDC4;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .output-media {
+            max-width: 100%;
+            max-height: 600px;
+            border-radius: 8px;
+            margin-top: 20px;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        
+        .download-btn {
+            display: inline-block;
+            background: #28a745;
+            color: white;
+            padding: 8px 16px;
+            text-decoration: none;
+            border-radius: 4px;
+            margin-top: 10px;
+            font-size: 14px;
+        }
+        
+        .download-btn:hover {
+            background: #218838;
+            color: white;
+            text-decoration: none;
+        }
+        
+        .api-status {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            color: #856404;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Face Recognition System</h1>
+            <p>GPU-Accelerated Face Detection & Recognition</p>
+            <div class="gpu-badge">⚡ CUDA Enabled</div>
+        </div>
+        
+        <div class="content">
+            <div id="api-status" class="api-status">
+                <strong>Status:</strong> Checking system health...
+            </div>
+            
+            <div class="section">
+                <h2>📝 Enroll New Face</h2>
+                <form id="enrollForm">
+                    <div class="form-group">
+                        <label for="personName">Person Name:</label>
+                        <input type="text" id="personName" name="personName" required 
+                               placeholder="Enter person's full name">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="personId">Person ID:</label>
+                        <input type="text" id="personId" name="personId" required 
+                               placeholder="Enter unique person ID (e.g., EMP001)">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="enrollImage">Face Image:</label>
+                        <input type="file" id="enrollImage" name="enrollImage" 
+                               accept="image/*" required>
+                    </div>
+                    
+                    <button type="submit" class="btn" id="enrollBtn">
+                        👤 Enroll Face
+                    </button>
+                </form>
+                
+                <div class="loading" id="enrollLoading">
+                    <div class="spinner"></div>
+                    <p>Processing enrollment on GPU...</p>
+                </div>
+                
+                <div class="result" id="enrollResult"></div>
+            </div>
+            
+            <div class="section">
+                <h2>🔍 Process Media</h2>
+                <form id="processForm">
+                    <div class="form-group">
+                        <label for="mediaFile">Image or Video:</label>
+                        <input type="file" id="mediaFile" name="mediaFile" 
+                               accept="image/*,video/*" required>
+                    </div>
+                    
+                    <button type="submit" class="btn" id="processBtn">
+                        🎯 Process & Recognize
+                    </button>
+                </form>
+                
+                <div class="loading" id="processLoading">
+                    <div class="spinner"></div>
+                    <p id="processingText">Processing media with GPU acceleration...</p>
+                    <div id="progressInfo" style="margin-top: 10px; font-size: 0.9em; color: #666;"></div>
+                </div>
+                
+                <div class="result" id="processResult"></div>
+                <div id="outputMedia"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Check API health on page load
+        async function checkHealth() {
+            try {
+                const response = await fetch('/api/health');
+                const data = await response.json();
+                const statusDiv = document.getElementById('api-status');
+                
+                if (data.status === 'healthy') {
+                    statusDiv.innerHTML = `
+                        <strong>✅ System Status:</strong> Healthy | 
+                        <strong>Model:</strong> ${data.model_loaded ? 'Loaded' : 'Not Loaded'} | 
+                        <strong>Time:</strong> ${new Date(data.timestamp).toLocaleString()}
+                    `;
+                    statusDiv.className = 'api-status success';
+                } else {
+                    statusDiv.innerHTML = '<strong>❌ System Status:</strong> Unhealthy';
+                    statusDiv.className = 'api-status error';
+                }
+            } catch (error) {
+                document.getElementById('api-status').innerHTML = 
+                    '<strong>⚠️ System Status:</strong> Cannot connect to server';
+            }
+        }
+
+        // Enroll face form handler
+        document.getElementById('enrollForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const formData = new FormData(e.target);
+            const btn = document.getElementById('enrollBtn');
+            const loading = document.getElementById('enrollLoading');
+            const result = document.getElementById('enrollResult');
+            
+            btn.disabled = true;
+            loading.style.display = 'block';
+            result.style.display = 'none';
+            
+            try {
+                const response = await fetch('/api/enroll', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                result.className = `result ${data.success ? 'success' : 'error'}`;
+                result.textContent = data.message;
+                result.style.display = 'block';
+                
+                if (data.success) {
+                    e.target.reset();
+                }
+            } catch (error) {
+                result.className = 'result error';
+                result.textContent = 'Error: ' + error.message;
+                result.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+                loading.style.display = 'none';
+            }
+        });
+
+        // Process media form handler
+        document.getElementById('processForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const formData = new FormData(e.target);
+            const btn = document.getElementById('processBtn');
+            const loading = document.getElementById('processLoading');
+            const result = document.getElementById('processResult');
+            const outputMedia = document.getElementById('outputMedia');
+            const processingText = document.getElementById('processingText');
+            const progressInfo = document.getElementById('progressInfo');
+            
+            // Check if it's a video file
+            const fileInput = document.getElementById('mediaFile');
+            const isVideo = fileInput.files[0] && fileInput.files[0].type.startsWith('video/');
+            
+            btn.disabled = true;
+            loading.style.display = 'block';
+            result.style.display = 'none';
+            outputMedia.innerHTML = '';
+            
+            if (isVideo) {
+                processingText.textContent = 'Processing video with GPU acceleration...';
+                progressInfo.textContent = 'This may take several minutes for long videos.';
+            } else {
+                processingText.textContent = 'Processing image with GPU acceleration...';
+                progressInfo.textContent = 'Face detection and recognition in progress...';
+            }
+            
+            try {
+                const response = await fetch('/api/process', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                result.className = `result ${data.success ? 'success' : 'error'}`;
+                result.textContent = data.message;
+                result.style.display = 'block';
+                
+                if (data.success && data.output_path) {
+                    const mediaElement = data.media_type === 'video' ? 
+                        `<video controls class="output-media" preload="metadata">
+                            <source src="${data.output_path}" type="video/mp4">
+                            Your browser does not support the video tag.
+                         </video>` :
+                        `<img src="${data.output_path}" class="output-media" alt="Processed image">`;
+                    
+                    let statsHtml = `
+                        <div style="background: #f8f9fa; padding: 15px; border-radius: 8px; margin-top: 15px;">
+                            <h4>📊 Processing Results:</h4>
+                            <p><strong>Media type:</strong> ${data.media_type}</p>
+                            <p><strong>Faces detected:</strong> ${data.faces_detected}</p>
+                    `;
+                    
+                    if (data.statistics) {
+                        if (data.statistics.total_frames) {
+                            statsHtml += `<p><strong>Total frames:</strong> ${data.statistics.total_frames}</p>`;
+                        }
+                        if (data.statistics.unique_people > 0) {
+                            statsHtml += `<p><strong>Unique people recognized:</strong> ${data.statistics.unique_people}</p>`;
+                            statsHtml += `<p><strong>Recognized names:</strong> ${data.statistics.recognized_names.join(', ')}</p>`;
+                        } else {
+                            statsHtml += `<p><strong>Recognition:</strong> No known faces found</p>`;
+                        }
+                    }
+                    
+                    statsHtml += `</div>`;
+                    
+                    // Extract filename for download link
+                    const filename = data.output_path.split('/').pop();
+                    const downloadLink = `/api/download/${filename}`;
+                    
+                    outputMedia.innerHTML = `
+                        <h3>🎯 Recognition Results:</h3>
+                        ${mediaElement}
+                        ${statsHtml}
+                        <div style="margin-top: 15px;">
+                            <a href="${downloadLink}" class="download-btn" target="_blank">
+                                📥 Download Processed ${data.media_type.charAt(0).toUpperCase() + data.media_type.slice(1)}
+                            </a>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                result.className = 'result error';
+                result.textContent = 'Error: ' + error.message;
+                result.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+                loading.style.display = 'none';
+            }
+        });
+
+        // Check health on page load
+        checkHealth();
+        
+        // Refresh health status every 30 seconds
+        setInterval(checkHealth, 30000);
+    </script>
+</body>
+</html>
