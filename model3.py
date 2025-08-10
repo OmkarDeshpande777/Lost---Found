@@ -253,16 +253,18 @@ class FaceRecognitionModel:
             logger.error(f"Error recognizing face: {e}")
             return "Unknown", 0.0
     
-    def process_video(self, video_path: str, output_path: str = None) -> str:
+    def process_video(self, video_path: str, output_path: str = None, skip_frames: int = 5, resize_factor: float = 0.5) -> tuple:
         """
-        Process video for face recognition
+        Process video for face recognition with optimizations
         
         Args:
             video_path: Path to input video
             output_path: Path to output video (optional)
+            skip_frames: Process every Nth frame for speed (default: 5)
+            resize_factor: Resize frame for faster processing (default: 0.5)
             
         Returns:
-            Path to output video
+            Tuple of (output_path, statistics_dict)
         """
         if output_path is None:
             output_path = "recognized_output.mp4"
@@ -279,87 +281,128 @@ class FaceRecognitionModel:
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
-            # Setup video writer with better codec for web compatibility
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Use mp4v for better compatibility
+            # Calculate processing parameters for speed optimization
+            process_width = int(width * resize_factor)
+            process_height = int(height * resize_factor)
+            
+            # Use H.264 codec for better web compatibility and compression
+            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec
             out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
             
+            if not out.isOpened():
+                # Fallback to mp4v if H.264 fails
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+                
             if not out.isOpened():
                 logger.error("Failed to open video writer")
                 raise ValueError("Could not initialize video writer")
             
-            logger.info(f"Processing {total_frames} frames on {self.device}...")
-            logger.info(f"Video specs: {width}x{height} @ {fps}fps")
+            logger.info(f"🚀 OPTIMIZED Processing: {total_frames} frames on {self.device}")
+            logger.info(f"📹 Video specs: {width}x{height} @ {fps}fps")
+            logger.info(f"⚡ Optimizations: Skip {skip_frames} frames, Resize to {resize_factor*100}%")
             
             frame_count = 0
+            processed_count = 0
             faces_detected_total = 0
             recognized_faces = set()
-            batch_size = 8 if torch.cuda.is_available() else 1  # Process multiple frames at once on GPU
+            last_detections = []  # Cache last detections for skipped frames
             
-            with tqdm(total=total_frames, desc="Processing frames") as pbar:
+            with tqdm(total=total_frames, desc="🎬 Processing video") as pbar:
                 while True:
                     ret, frame = cap.read()
                     if not ret:
                         break
                     
-                    # Detect faces
-                    boxes, _ = self.mtcnn.detect(frame)
+                    # Use cached detections for skipped frames to maintain smooth output
+                    if frame_count % skip_frames == 0:
+                        # Resize frame for faster processing
+                        small_frame = cv2.resize(frame, (process_width, process_height))
+                        
+                        # Detect faces on smaller frame
+                        boxes, _ = self.mtcnn.detect(small_frame)
+                        
+                        # Scale boxes back to original size
+                        current_detections = []
+                        if boxes is not None:
+                            scale_x = width / process_width
+                            scale_y = height / process_height
+                            
+                            for box in boxes:
+                                x1, y1, x2, y2 = map(int, box)
+                                # Scale back to original size
+                                x1 = int(x1 * scale_x)
+                                y1 = int(y1 * scale_y)
+                                x2 = int(x2 * scale_x)
+                                y2 = int(y2 * scale_y)
+                                
+                                # Add padding
+                                padding = 5
+                                x1 = max(0, x1 - padding)
+                                y1 = max(0, y1 - padding)
+                                x2 = min(width, x2 + padding)
+                                y2 = min(height, y2 + padding)
+                                
+                                face_crop = frame[y1:y2, x1:x2]
+                                embedding = self.get_embedding(face_crop)
+                                
+                                if embedding is not None:
+                                    faces_detected_total += 1
+                                    name, score = self.recognize_face(embedding)
+                                    
+                                    if name != "Unknown":
+                                        recognized_faces.add(name)
+                                    
+                                    current_detections.append({
+                                        'box': (x1, y1, x2, y2),
+                                        'name': name,
+                                        'score': score
+                                    })
+                        
+                        last_detections = current_detections
+                        processed_count += 1
                     
-                    if boxes is not None:
-                        for box in boxes:
-                            x1, y1, x2, y2 = map(int, box)
-                            
-                            # Add padding
-                            padding = 5
-                            x1 = max(0, x1 - padding)
-                            y1 = max(0, y1 - padding)
-                            x2 = min(width, x2 + padding)
-                            y2 = min(height, y2 + padding)
-                            
-                            face_crop = frame[y1:y2, x1:x2]
-                            embedding = self.get_embedding(face_crop)
-                            
-                            if embedding is not None:
-                                faces_detected_total += 1
-                                name, score = self.recognize_face(embedding)
-                                
-                                if name != "Unknown":
-                                    recognized_faces.add(name)
-                                
-                                # Draw bounding box and label with better styling
-                                color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
-                                thickness = 3
-                                cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-                                
-                                # Prepare label
-                                label = f"{name}"
-                                if name != "Unknown":
-                                    confidence_percent = int(score * 100)
-                                    label += f" ({confidence_percent}%)"
-                                
-                                # Calculate text size and background
-                                font_scale = 0.7
-                                font_thickness = 2
-                                (text_width, text_height), baseline = cv2.getTextSize(
-                                    label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness
-                                )
-                                
-                                # Draw background rectangle for text
-                                text_y = y1 - 10
-                                if text_y - text_height - 10 < 0:  # If too close to top, put text below
-                                    text_y = y2 + text_height + 10
-                                
-                                cv2.rectangle(
-                                    frame, 
-                                    (x1, text_y - text_height - 5), 
-                                    (x1 + text_width + 10, text_y + 5), 
-                                    color, -1
-                                )
-                                
-                                # Draw text
-                                cv2.putText(
-                                    frame, label, (x1 + 5, text_y), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness
-                                )
+                    # Draw detections (using last detections for skipped frames)
+                    for detection in last_detections:
+                        x1, y1, x2, y2 = detection['box']
+                        name = detection['name']
+                        score = detection['score']
+                        
+                        # Draw bounding box and label with better styling
+                        color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                        thickness = 3
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                        
+                        # Prepare label
+                        label = f"{name}"
+                        if name != "Unknown":
+                            confidence_percent = int(score * 100)
+                            label += f" ({confidence_percent}%)"
+                        
+                        # Calculate text size and background
+                        font_scale = 0.7
+                        font_thickness = 2
+                        (text_width, text_height), baseline = cv2.getTextSize(
+                            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness
+                        )
+                        
+                        # Draw background rectangle for text
+                        text_y = y1 - 10
+                        if text_y - text_height - 10 < 0:  # If too close to top, put text below
+                            text_y = y2 + text_height + 10
+                        
+                        cv2.rectangle(
+                            frame, 
+                            (x1, text_y - text_height - 5), 
+                            (x1 + text_width + 10, text_y + 5), 
+                            color, -1
+                        )
+                        
+                        # Draw text
+                        cv2.putText(
+                            frame, label, (x1 + 5, text_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness
+                        )
                     
                     out.write(frame)
                     frame_count += 1
@@ -368,16 +411,19 @@ class FaceRecognitionModel:
             cap.release()
             out.release()
             
-            logger.info(f"✅ Processed {frame_count} frames. Output saved to: {output_path}")
-            logger.info(f"📊 Statistics: {faces_detected_total} faces detected, {len(recognized_faces)} unique people recognized")
+            logger.info(f"✅ SPEED OPTIMIZED: Processed {frame_count} frames in record time!")
+            logger.info(f"🚀 Actually processed {processed_count} frames (skipped {frame_count - processed_count} for speed)")
+            logger.info(f"📊 Statistics: {faces_detected_total} faces detected, {len(recognized_faces)} unique people")
             if recognized_faces:
                 logger.info(f"👥 Recognized people: {', '.join(recognized_faces)}")
             
             return output_path, {
                 'total_frames': frame_count,
+                'processed_frames': processed_count,
                 'faces_detected': faces_detected_total,
                 'unique_people': len(recognized_faces),
-                'recognized_names': list(recognized_faces)
+                'recognized_names': list(recognized_faces),
+                'optimization': f"Processed every {skip_frames} frames at {resize_factor*100}% size"
             }
             
         except Exception as e:
