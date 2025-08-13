@@ -1,0 +1,52 @@
+{
+  "sample_person_123": {
+    "name": "John Doe",
+    "enrolled_date": "2025-08-10T20:00:00.000Z",
+    "confidence_threshold": 0.8,
+    "times_recognized": 5,
+    "last_updated": "2025-08-10T22:00:00.000Z"
+  },
+  "001": {
+    "enrolled_date": "2025-08-10T22:46:48.750182",
+    "times_recognized": 43,
+    "confidence_threshold": 0.8,
+    "name": "Omkar",
+    "last_updated": "2025-08-10T23:28:45.719656",
+    "last_recognized": "2025-08-13T23:48:05.626629"
+  },
+  "002": {
+    "enrolled_date": "2025-08-10T22:58:51.814938",
+    "times_recognized": 0,
+    "confidence_threshold": 0.8,
+    "name": "Samihan",
+    "last_updated": "2025-08-10T22:58:51.814938"
+  },
+  "004": {
+    "enrolled_date": "2025-08-10T23:01:00.319319",
+    "times_recognized": 0,
+    "confidence_threshold": 0.8,
+    "name": "Pratik",
+    "last_updated": "2025-08-10T23:01:00.319319"
+  },
+  "005": {
+    "enrolled_date": "2025-08-10T23:02:18.874457",
+    "times_recognized": 0,
+    "confidence_threshold": 0.8,
+    "name": "Archit",
+    "last_updated": "2025-08-10T23:02:18.874457"
+  },
+  "006": {
+    "enrolled_date": "2025-08-10T23:08:46.016194",
+    "times_recognized": 0,
+    "confidence_threshold": 0.8,
+    "name": "Aditya",
+    "last_updated": "2025-08-10T23:08:46.016194"
+  },
+  "07": {
+    "enrolled_date": "2025-08-10T23:29:16.055971",
+    "times_recognized": 0,
+    "confidence_threshold": 0.8,
+    "name": "Anuj",
+    "last_updated": "2025-08-10T23:29:31.481021"
+  }
+}

@@ -3,6 +3,8 @@ import torch
 import numpy as np
 import os
 import logging
+import json
+from datetime import datetime
 from typing import Optional, List, Tuple, Dict, Any
 from pathlib import Path
 import tempfile
@@ -210,6 +212,10 @@ class FaceRecognitionModel:
                     embedding.tolist(), 
                     {"name": name, "image_path": image_path}
                 )])
+                
+                # Save face image for frontend display
+                self.save_face_image(person_id, face_crop, name)
+                
                 logger.info(f"Enrolled {name} with ID {person_id}")
                 return True
             else:
@@ -285,17 +291,24 @@ class FaceRecognitionModel:
             process_width = int(width * resize_factor)
             process_height = int(height * resize_factor)
             
-            # Use H.264 codec for better web compatibility and compression
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # H.264 codec
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            # Try different codecs for better compatibility
+            fourcc_options = [
+                cv2.VideoWriter_fourcc(*'mp4v'),  # MPEG-4 codec (most compatible)
+                cv2.VideoWriter_fourcc(*'H264'),  # H.264 codec
+                cv2.VideoWriter_fourcc(*'avc1'),  # Another H.264 variant
+                cv2.VideoWriter_fourcc(*'MJPG'),  # Motion JPEG (fallback)
+            ]
             
-            if not out.isOpened():
-                # Fallback to mp4v if H.264 fails
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            out = None
+            for fourcc in fourcc_options:
                 out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+                if out.isOpened():
+                    logger.info(f"✅ Using codec: {fourcc}")
+                    break
+                out.release()
                 
-            if not out.isOpened():
-                logger.error("Failed to open video writer")
+            if out is None or not out.isOpened():
+                logger.error("Failed to open video writer with any codec")
                 raise ValueError("Could not initialize video writer")
             
             logger.info(f"🚀 OPTIMIZED Processing: {total_frames} frames on {self.device}")
@@ -530,25 +543,61 @@ class FaceRecognitionModel:
             logger.error(f"Error processing image: {e}")
             raise
     
-    def get_enrolled_faces(self) -> List[Dict[str, Any]]:
+    def get_enrolled_faces(self) -> Dict[str, Any]:
         """
-        Get list of enrolled faces
+        Get list of enrolled faces with metadata
         
         Returns:
-            List of enrolled face metadata
+            Dictionary containing face data and statistics
         """
         try:
-            # Query all vectors (this is a simplified approach)
-            # In production, you might want to use a separate metadata store
+            # Create faces directory if it doesn't exist
+            faces_dir = Path("enrolled_faces")
+            faces_dir.mkdir(exist_ok=True)
+            
+            # Get face images and metadata
+            faces_list = []
+            metadata_file = faces_dir / "metadata.json"
+            
+            # Load existing metadata
+            metadata = {}
+            if metadata_file.exists():
+                try:
+                    with open(metadata_file, 'r', encoding='utf-8') as f:
+                        metadata = json.load(f)
+                except:
+                    metadata = {}
+            
+            # Scan for face images
+            for img_file in faces_dir.glob("*.jpg"):
+                face_id = img_file.stem
+                face_data = {
+                    "id": face_id,
+                    "name": metadata.get(face_id, {}).get("name", f"Person_{face_id[:8]}"),
+                    "image_path": str(img_file),
+                    "enrolled_date": metadata.get(face_id, {}).get("enrolled_date", "Unknown"),
+                    "confidence_threshold": metadata.get(face_id, {}).get("confidence_threshold", 0.8),
+                    "times_recognized": metadata.get(face_id, {}).get("times_recognized", 0)
+                }
+                faces_list.append(face_data)
+            
+            # Get index statistics
             stats = self.index.describe_index_stats()
-            return {"total_faces": stats.total_vector_count}
+            
+            return {
+                "faces": faces_list,
+                "total_faces": len(faces_list),
+                "vector_count": stats.total_vector_count,
+                "last_updated": datetime.now().isoformat()
+            }
+            
         except Exception as e:
             logger.error(f"Error getting enrolled faces: {e}")
-            return {"total_faces": 0}
+            return {"faces": [], "total_faces": 0, "vector_count": 0}
     
     def delete_face(self, person_id: str) -> bool:
         """
-        Delete a face from the database
+        Delete a face from the database and remove associated files
         
         Args:
             person_id: Person ID to delete
@@ -557,9 +606,172 @@ class FaceRecognitionModel:
             True if deletion successful, False otherwise
         """
         try:
+            # Delete from Pinecone index
             self.index.delete(ids=[person_id])
+            
+            # Delete image file and update metadata
+            faces_dir = Path("enrolled_faces")
+            img_file = faces_dir / f"{person_id}.jpg"
+            if img_file.exists():
+                img_file.unlink()
+            
+            # Update metadata
+            metadata_file = faces_dir / "metadata.json"
+            if metadata_file.exists():
+                try:
+                    with open(metadata_file, 'r', encoding='utf-8') as f:
+                        metadata = json.load(f)
+                    if person_id in metadata:
+                        del metadata[person_id]
+                    with open(metadata_file, 'w', encoding='utf-8') as f:
+                        json.dump(metadata, f, indent=2)
+                except:
+                    pass
+            
             logger.info(f"Deleted face with ID: {person_id}")
             return True
         except Exception as e:
             logger.error(f"Error deleting face: {e}")
+            return False
+
+    def update_face_metadata(self, person_id: str, name: str = None, confidence_threshold: float = None) -> bool:
+        """
+        Update face metadata
+        
+        Args:
+            person_id: Person ID to update
+            name: New name for the person
+            confidence_threshold: New confidence threshold
+            
+        Returns:
+            True if update successful, False otherwise
+        """
+        try:
+            faces_dir = Path("enrolled_faces")
+            faces_dir.mkdir(exist_ok=True)
+            metadata_file = faces_dir / "metadata.json"
+            
+            # Load existing metadata
+            metadata = {}
+            if metadata_file.exists():
+                try:
+                    with open(metadata_file, 'r', encoding='utf-8') as f:
+                        metadata = json.load(f)
+                except:
+                    metadata = {}
+            
+            # Update metadata
+            if person_id not in metadata:
+                metadata[person_id] = {}
+            
+            if name is not None:
+                metadata[person_id]["name"] = name
+            if confidence_threshold is not None:
+                metadata[person_id]["confidence_threshold"] = confidence_threshold
+            
+            metadata[person_id]["last_updated"] = datetime.now().isoformat()
+            
+            # Save metadata
+            with open(metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2)
+            
+            logger.info(f"Updated metadata for person ID: {person_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error updating face metadata: {e}")
+            return False
+
+    def save_face_image(self, person_id: str, face_image: np.ndarray, name: str = None) -> bool:
+        """
+        Save face image to enrolled faces directory
+        
+        Args:
+            person_id: Person ID
+            face_image: Face image as numpy array
+            name: Person name
+            
+        Returns:
+            True if save successful, False otherwise
+        """
+        try:
+            faces_dir = Path("enrolled_faces")
+            faces_dir.mkdir(exist_ok=True)
+            
+            # Save image
+            img_path = faces_dir / f"{person_id}.jpg"
+            cv2.imwrite(str(img_path), face_image)
+            
+            # Update metadata
+            metadata_file = faces_dir / "metadata.json"
+            metadata = {}
+            if metadata_file.exists():
+                try:
+                    with open(metadata_file, 'r', encoding='utf-8') as f:
+                        metadata = json.load(f)
+                except:
+                    metadata = {}
+            
+            if person_id not in metadata:
+                metadata[person_id] = {
+                    "enrolled_date": datetime.now().isoformat(),
+                    "times_recognized": 0,
+                    "confidence_threshold": 0.8
+                }
+            
+            if name:
+                metadata[person_id]["name"] = name
+            
+            metadata[person_id]["last_updated"] = datetime.now().isoformat()
+            
+            with open(metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(metadata, f, indent=2)
+            
+            logger.info(f"Saved face image for person ID: {person_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error saving face image: {e}")
+            return False
+
+    def update_recognition_count(self, person_id: str) -> bool:
+        """
+        Update the recognition count for a person
+        
+        Args:
+            person_id: Person ID to update
+            
+        Returns:
+            True if update successful, False otherwise
+        """
+        try:
+            faces_dir = Path("enrolled_faces")
+            metadata_file = faces_dir / "metadata.json"
+            
+            if not metadata_file.exists():
+                return False
+            
+            # Load metadata
+            metadata = {}
+            try:
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+            except:
+                return False
+            
+            if person_id in metadata:
+                # Increment recognition count
+                metadata[person_id]["times_recognized"] = metadata[person_id].get("times_recognized", 0) + 1
+                metadata[person_id]["last_recognized"] = datetime.now().isoformat()
+                
+                # Save updated metadata
+                with open(metadata_file, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error updating recognition count: {e}")
             return False

@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_from_directory, render_template_string
+from flask import Flask, request, jsonify, send_from_directory, render_template_string, Response
 from flask_cors import CORS
 import os
 import sys
@@ -9,6 +9,8 @@ import logging
 from pathlib import Path
 import json
 from werkzeug.utils import secure_filename
+import torch
+import cv2
 
 # Import our face recognition model
 from model3 import FaceRecognitionModel
@@ -202,8 +204,20 @@ def process_media():
         # Process media with optimization settings
         if is_video(file.filename):
             # Get optimization parameters from request
-            skip_frames = int(request.form.get('skip_frames', 5))  # Process every 5th frame by default
-            resize_factor = float(request.form.get('resize_factor', 0.5))  # 50% size by default
+            quality_mode = request.form.get('quality_mode', 'balanced')  # balanced, fast, maximum
+            
+            if quality_mode == 'maximum':
+                # Maximum quality: process all frames at full resolution
+                skip_frames = 1  # Process every frame
+                resize_factor = 1.0  # 100% resolution
+            elif quality_mode == 'fast':
+                # Fast processing: skip more frames, lower resolution
+                skip_frames = int(request.form.get('skip_frames', 10))
+                resize_factor = float(request.form.get('resize_factor', 0.3))
+            else:  # balanced (default)
+                # Balanced: moderate optimization
+                skip_frames = int(request.form.get('skip_frames', 5))  # Process every 5th frame by default
+                resize_factor = float(request.form.get('resize_factor', 0.5))  # 50% size by default
             
             result_path, stats = face_model.process_video(input_path, output_path, skip_frames, resize_factor)
             faces_detected = stats.get('faces_detected', 0)
@@ -244,21 +258,21 @@ def process_media():
 
 @app.route('/api/faces', methods=['GET'])
 def get_enrolled_faces():
-    """Get list of enrolled faces"""
+    """Get list of enrolled faces with photos and metadata"""
     if not face_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
 
     try:
-        # Get enrolled faces info
-        faces_info = face_model.get_enrolled_faces()
+        # Get enrolled faces info with images and metadata
+        faces_data = face_model.get_enrolled_faces()
         
-        # This is a simplified response since Pinecone doesn't easily allow listing all vectors
-        # In a production system, you'd maintain a separate metadata store
         return jsonify({
             'success': True,
-            'faces': [],  # Would contain actual face data in production
-            'total_count': faces_info.get('total_faces', 0),
-            'message': f"Total enrolled faces: {faces_info.get('total_faces', 0)}"
+            'faces': faces_data.get('faces', []),
+            'total_count': faces_data.get('total_faces', 0),
+            'vector_count': faces_data.get('vector_count', 0),
+            'last_updated': faces_data.get('last_updated'),
+            'message': f"Found {faces_data.get('total_faces', 0)} enrolled faces"
         })
 
     except Exception as e:
@@ -285,6 +299,139 @@ def delete_face(face_id):
     except Exception as e:
         logger.error(f"Error deleting face: {e}")
         return jsonify({'success': False, 'message': f'Deletion failed: {str(e)}'}), 500
+
+@app.route('/api/faces/<face_id>', methods=['PUT'])
+def update_face(face_id):
+    """Update face metadata (name, confidence threshold)"""
+    if not face_model:
+        return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
+
+    try:
+        data = request.get_json()
+        name = data.get('name')
+        confidence_threshold = data.get('confidence_threshold')
+        
+        success = face_model.update_face_metadata(face_id, name=name, confidence_threshold=confidence_threshold)
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': f'Face {face_id} updated successfully'
+            })
+        else:
+            return jsonify({'success': False, 'message': 'Failed to update face'}), 400
+
+    except Exception as e:
+        logger.error(f"Error updating face: {e}")
+        return jsonify({'success': False, 'message': f'Update failed: {str(e)}'}), 500
+
+@app.route('/api/faces/<face_id>/image', methods=['POST'])
+def update_face_image(face_id):
+    """Update face image"""
+    if not face_model:
+        return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
+
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'message': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'success': False, 'message': 'No file selected'}), 400
+
+        if file and allowed_file(file.filename) and is_image(file.filename):
+            # Save uploaded file temporarily
+            filename = secure_filename(file.filename)
+            temp_path = os.path.join(app.config['UPLOAD_FOLDER'], f"temp_{filename}")
+            file.save(temp_path)
+
+            try:
+                # Load and process the image
+                img = cv2.imread(temp_path)
+                if img is None:
+                    return jsonify({'success': False, 'message': 'Invalid image file'}), 400
+
+                # Detect faces
+                boxes, _ = face_model.mtcnn.detect(img)
+                if boxes is None or len(boxes) == 0:
+                    return jsonify({'success': False, 'message': 'No faces detected in image'}), 400
+
+                # Process the first detected face
+                box = boxes[0]
+                x1, y1, x2, y2 = map(int, box)
+                
+                # Add padding
+                h, w = img.shape[:2]
+                padding = 10
+                x1 = max(0, x1 - padding)
+                y1 = max(0, y1 - padding)
+                x2 = min(w, x2 + padding)
+                y2 = min(h, y2 + padding)
+                
+                face_crop = img[y1:y2, x1:x2]
+                
+                # Get new embedding
+                embedding = face_model.get_embedding(face_crop)
+                if embedding is None:
+                    return jsonify({'success': False, 'message': 'Failed to process face'}), 400
+
+                # Update in Pinecone (get existing metadata first)
+                query_result = face_model.index.query(id=face_id, top_k=1, include_metadata=True)
+                if query_result.matches:
+                    existing_metadata = query_result.matches[0].metadata
+                    face_model.index.upsert(vectors=[(
+                        face_id, 
+                        embedding.tolist(), 
+                        existing_metadata
+                    )])
+                
+                # Save new face image
+                face_model.save_face_image(face_id, face_crop)
+                
+                return jsonify({
+                    'success': True,
+                    'message': f'Face image updated successfully for {face_id}'
+                })
+
+            finally:
+                # Clean up temp file
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+        else:
+            return jsonify({'success': False, 'message': 'Invalid file type'}), 400
+
+    except Exception as e:
+        logger.error(f"Error updating face image: {e}")
+        return jsonify({'success': False, 'message': f'Image update failed: {str(e)}'}), 500
+
+@app.route('/enrolled_faces/<path:filename>')
+def serve_face_image(filename):
+    """Serve enrolled face images"""
+    return send_from_directory('enrolled_faces', filename)
+
+@app.route('/api/face-database')
+def get_face_database_info():
+    """Get face database information for the frontend"""
+    if not face_model:
+        return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
+
+    try:
+        faces_data = face_model.get_enrolled_faces()
+        
+        return jsonify({
+            'success': True,
+            'database': {
+                'total_faces': faces_data.get('total_faces', 0),
+                'vector_count': faces_data.get('vector_count', 0),
+                'last_updated': faces_data.get('last_updated'),
+                'status': 'Active'
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"Error getting database info: {e}")
+        return jsonify({'success': False, 'message': f'Database error: {str(e)}'}), 500
 
 @app.route('/api/convert-video', methods=['POST'])
 def convert_video_for_web():
@@ -331,22 +478,237 @@ def convert_video_for_web():
         logger.error(f"Error converting video: {e}")
         return jsonify({'success': False, 'message': f'Conversion error: {str(e)}'}), 500
 
+# Global variables for camera
+camera_active = False
+camera_cap = None
+
 # 🚀 FEATURE 1: Real-time Camera Feed Processing
 @app.route('/api/camera/start', methods=['POST'])
 def start_camera():
     """Start real-time camera processing"""
+    global camera_active, camera_cap
+    
     if not face_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
     try:
-        # This would start a camera stream (implementation depends on setup)
+        if camera_active:
+            return jsonify({'success': False, 'message': 'Camera is already running'}), 400
+        
+        # Test camera access first
+        test_cap = cv2.VideoCapture(0)
+        if not test_cap.isOpened():
+            test_cap.release()
+            return jsonify({'success': False, 'message': 'Cannot access camera. Please check if camera is available and not being used by another application.'}), 400
+        test_cap.release()
+        
+        camera_active = True
+        logger.info("✅ Camera started successfully")
+        
         return jsonify({
             'success': True,
             'message': 'Camera stream started',
             'stream_url': '/api/camera/stream'
         })
     except Exception as e:
+        logger.error(f"Camera start error: {e}")
         return jsonify({'success': False, 'message': f'Camera error: {str(e)}'}), 500
+
+@app.route('/api/camera/stop', methods=['POST'])
+def stop_camera():
+    """Stop camera stream"""
+    global camera_active, camera_cap
+    
+    try:
+        camera_active = False
+        if camera_cap:
+            camera_cap.release()
+            camera_cap = None
+        
+        logger.info("✅ Camera stopped successfully")
+        
+        return jsonify({
+            'success': True,
+            'message': 'Camera stream stopped'
+        })
+    except Exception as e:
+        logger.error(f"Camera stop error: {e}")
+        return jsonify({'success': False, 'message': f'Camera stop error: {str(e)}'}), 500
+
+@app.route('/api/camera/stream')
+def camera_stream():
+    """Video streaming route for camera feed"""
+    def generate_frames():
+        global camera_active, camera_cap
+        
+        logger.info("Starting camera stream generation...")
+        
+        # Try to open camera with different backends
+        for backend in [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]:
+            camera_cap = cv2.VideoCapture(0, backend)
+            if camera_cap.isOpened():
+                logger.info(f"✅ Camera opened with backend: {backend}")
+                break
+            camera_cap.release()
+        else:
+            logger.error("❌ Failed to open camera with any backend")
+            yield (b'--frame\r\n'
+                   b'Content-Type: text/plain\r\n\r\n'
+                   b'Camera access failed' + b'\r\n')
+            return
+        
+        # Set camera properties for better performance
+        camera_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        camera_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        camera_cap.set(cv2.CAP_PROP_FPS, 30)
+        camera_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer to minimize lag
+        
+        # Get actual camera properties
+        actual_width = int(camera_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(camera_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        logger.info(f"📹 Camera resolution: {actual_width}x{actual_height}")
+        
+        frame_count = 0
+        process_every_n_frames = 3  # Process every 3rd frame for better performance
+        last_faces = []  # Store last detected faces for smoother display
+        
+        try:
+            while camera_active:
+                success, frame = camera_cap.read()
+                if not success:
+                    logger.warning("Failed to read frame from camera")
+                    break
+                
+                frame_count += 1
+                
+                # Process face recognition every nth frame
+                if frame_count % process_every_n_frames == 0 and face_model:
+                    try:
+                        # Detect faces
+                        boxes, _ = face_model.mtcnn.detect(frame)
+                        
+                        if boxes is not None and len(boxes) > 0:
+                            current_faces = []
+                            
+                            for box in boxes:
+                                x1, y1, x2, y2 = map(int, box)
+                                
+                                # Add padding
+                                h, w = frame.shape[:2]
+                                padding = 20
+                                x1 = max(0, x1 - padding)
+                                y1 = max(0, y1 - padding)
+                                x2 = min(w, x2 + padding)
+                                y2 = min(h, y2 + padding)
+                                
+                                # Extract face
+                                face_crop = frame[y1:y2, x1:x2]
+                                
+                                # Skip if face is too small
+                                if face_crop.shape[0] < 50 or face_crop.shape[1] < 50:
+                                    continue
+                                
+                                # Get embedding and recognize
+                                embedding = face_model.get_embedding(face_crop)
+                                if embedding is not None:
+                                    # Query Pinecone for similar faces
+                                    results = face_model.index.query(
+                                        vector=embedding.tolist(),
+                                        top_k=1,
+                                        include_metadata=True
+                                    )
+                                    
+                                    name = "Unknown"
+                                    confidence = 0.0
+                                    
+                                    if results.matches and len(results.matches) > 0:
+                                        match = results.matches[0]
+                                        confidence = match.score
+                                        
+                                        if confidence > 0.7:  # Lower threshold for better detection
+                                            name = match.metadata.get('name', 'Unknown')
+                                            
+                                            # Update recognition count (less frequently to avoid spam)
+                                            if frame_count % 30 == 0:  # Once every 30 frames
+                                                face_id = match.id
+                                                face_model.update_recognition_count(face_id)
+                                    
+                                    current_faces.append({
+                                        'bbox': (x1, y1, x2, y2),
+                                        'name': name,
+                                        'confidence': confidence
+                                    })
+                            
+                            last_faces = current_faces
+                        else:
+                            # Gradually fade out old detections
+                            last_faces = []
+                    
+                    except Exception as e:
+                        logger.error(f"Face recognition error in camera stream: {e}")
+                        # Continue streaming even if face recognition fails
+                
+                # Draw faces from last detection
+                for face_info in last_faces:
+                    x1, y1, x2, y2 = face_info['bbox']
+                    name = face_info['name']
+                    confidence = face_info['confidence']
+                    
+                    # Draw bounding box and label
+                    color = (0, 255, 0) if name != "Unknown" else (0, 0, 255)
+                    thickness = 3
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
+                    
+                    # Draw name and confidence
+                    if name != "Unknown":
+                        label = f"{name} ({confidence:.2f})"
+                    else:
+                        label = "Unknown Person"
+                    
+                    # Calculate text size and background
+                    font = cv2.FONT_HERSHEY_SIMPLEX
+                    font_scale = 0.7
+                    font_thickness = 2
+                    label_size = cv2.getTextSize(label, font, font_scale, font_thickness)[0]
+                    
+                    # Draw background rectangle for text
+                    cv2.rectangle(frame, (x1, y1 - label_size[1] - 15), 
+                                (x1 + label_size[0] + 10, y1), color, -1)
+                    
+                    # Draw text
+                    cv2.putText(frame, label, (x1 + 5, y1 - 5), 
+                              font, font_scale, (255, 255, 255), font_thickness)
+                
+                # Add status overlay
+                status_text = f"LIVE CAMERA - Frame {frame_count}"
+                cv2.putText(frame, status_text, (10, 30), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                
+                # Encode frame as JPEG
+                encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+                ret, buffer = cv2.imencode('.jpg', frame, encode_param)
+                
+                if ret:
+                    frame_bytes = buffer.tobytes()
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                else:
+                    logger.warning("Failed to encode frame")
+                
+                # Control frame rate
+                import time
+                time.sleep(0.033)  # ~30 FPS
+        
+        except Exception as e:
+            logger.error(f"Camera stream error: {e}")
+        
+        finally:
+            if camera_cap:
+                camera_cap.release()
+                camera_cap = None
+            logger.info("Camera stream ended")
+    
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 # 🚀 FEATURE 2: Batch Processing Multiple Files
 @app.route('/api/batch-process', methods=['POST'])
@@ -694,15 +1056,80 @@ def uploaded_file(filename):
 
 @app.route('/outputs/<filename>')
 def output_file(filename):
-    """Serve processed output files"""
-    response = send_from_directory(app.config['OUTPUT_FOLDER'], filename)
+    """Serve processed output files with streaming support"""
+    from flask import Response, request
+    import os
     
-    # Add headers for better video streaming
+    file_path = os.path.join(app.config['OUTPUT_FOLDER'], filename)
+    
+    if not os.path.exists(file_path):
+        return jsonify({'error': 'File not found'}), 404
+    
+    # For video files, support range requests for better streaming
     if filename.endswith('.mp4'):
-        response.headers['Accept-Ranges'] = 'bytes'
-        response.headers['Content-Type'] = 'video/mp4'
-    
-    return response
+        file_size = os.path.getsize(file_path)
+        
+        # Handle range requests for video streaming
+        range_header = request.headers.get('Range', None)
+        if range_header:
+            byte_start = 0
+            byte_end = file_size - 1
+            
+            if range_header:
+                match = range_header.replace('bytes=', '').split('-')
+                if match[0]:
+                    byte_start = int(match[0])
+                if match[1]:
+                    byte_end = int(match[1])
+            
+            content_length = byte_end - byte_start + 1
+            
+            def generate():
+                with open(file_path, 'rb') as f:
+                    f.seek(byte_start)
+                    remaining = content_length
+                    while remaining:
+                        chunk_size = min(1024 * 1024, remaining)  # 1MB chunks
+                        data = f.read(chunk_size)
+                        if not data:
+                            break
+                        remaining -= len(data)
+                        yield data
+            
+            response = Response(
+                generate(),
+                206,  # Partial Content
+                headers={
+                    'Content-Range': f'bytes {byte_start}-{byte_end}/{file_size}',
+                    'Accept-Ranges': 'bytes',
+                    'Content-Length': str(content_length),
+                    'Content-Type': 'video/mp4',
+                }
+            )
+            return response
+        else:
+            # No range request, serve full file
+            def generate():
+                with open(file_path, 'rb') as f:
+                    while True:
+                        data = f.read(1024 * 1024)  # 1MB chunks
+                        if not data:
+                            break
+                        yield data
+            
+            response = Response(
+                generate(),
+                mimetype='video/mp4',
+                headers={
+                    'Accept-Ranges': 'bytes',
+                    'Content-Length': str(file_size),
+                    'Content-Type': 'video/mp4'
+                }
+            )
+            return response
+    else:
+        response = send_from_directory(app.config['OUTPUT_FOLDER'], filename)
+        return response
 
 @app.route('/api/download/<filename>')
 def download_file(filename):
