@@ -10,8 +10,12 @@ from pathlib import Path
 import tempfile
 import shutil
 
+# Configure torch serialization for YOLO model compatibility
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 try:
-    from facenet_pytorch import InceptionResnetV1, MTCNN
+    from facenet_pytorch import InceptionResnetV1
     from ultralytics import YOLO
     from pinecone import Pinecone, ServerlessSpec
     import torchvision.transforms as transforms
@@ -90,15 +94,49 @@ class FaceRecognitionModel:
                 pretrained='vggface2'
             ).eval().to(self.device)
             
-            # Face detection model (MTCNN)
-            self.mtcnn = MTCNN(
-                keep_all=True, 
-                device=self.device,
-                min_face_size=20,
-                thresholds=[0.6, 0.7, 0.7],
-                factor=0.709,
-                post_process=False
-            )
+            # Face detection model (YOLO8n)
+            yolo_model_path = r"C:\Document Local\Projects\Lost & Found\Models\Face_Detectbest.pt"
+            if not os.path.exists(yolo_model_path):
+                raise FileNotFoundError(f"YOLO model not found at: {yolo_model_path}")
+            
+            # Load YOLO model with compatibility settings for older model files
+            try:
+                # First try normal loading
+                self.yolo_model = YOLO(yolo_model_path)
+                logger.info("✅ YOLO model loaded successfully (normal mode)")
+            except Exception as e:
+                logger.warning(f"⚠️ Normal YOLO loading failed: {e}")
+                try:
+                    # Try with warning suppression for compatibility
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        # Temporarily modify torch loading behavior
+                        old_load = torch.load
+                        def safe_load(*args, **kwargs):
+                            kwargs['weights_only'] = False
+                            return old_load(*args, **kwargs)
+                        torch.load = safe_load
+                        
+                        self.yolo_model = YOLO(yolo_model_path)
+                        
+                        # Restore original torch.load
+                        torch.load = old_load
+                        logger.info("✅ YOLO model loaded successfully (compatibility mode)")
+                except Exception as e2:
+                    logger.error(f"❌ Failed to load YOLO model: {e2}")
+                    # Fallback to a basic face detection using OpenCV
+                    logger.warning("⚠️ Falling back to OpenCV face detection")
+                    self.yolo_model = None
+                    self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+            
+            if self.yolo_model and torch.cuda.is_available():
+                try:
+                    self.yolo_model.to(self.device)
+                    logger.info("✅ YOLO model moved to GPU")
+                except:
+                    logger.warning("⚠️ Could not move YOLO model to GPU, using CPU")
+            
+            logger.info(f"✅ Face detection model initialized")
             
             # Optimize for GPU if available
             if torch.cuda.is_available():
@@ -125,6 +163,87 @@ class FaceRecognitionModel:
             transforms.ToTensor(),
             transforms.Normalize([0.5] * 3, [0.5] * 3)
         ])
+    
+    def detect_faces(self, image: np.ndarray, confidence_threshold: float = 0.3) -> Optional[np.ndarray]:
+        """
+        Detect faces using YOLO model or OpenCV fallback with improved accuracy
+        
+        Args:
+            image: Input image as numpy array (BGR format)
+            confidence_threshold: Minimum confidence for face detection (lowered for better recall)
+            
+        Returns:
+            Array of bounding boxes in format [x1, y1, x2, y2] or None if no faces
+        """
+        try:
+            if self.yolo_model is not None:
+                # Use YOLO model with improved parameters for better accuracy
+                results = self.yolo_model(
+                    image, 
+                    conf=confidence_threshold,
+                    iou=0.45,  # Non-maximum suppression threshold
+                    verbose=False,
+                    imgsz=640,  # Input image size for better accuracy
+                    augment=True,  # Use test-time augmentation for better detection
+                    agnostic_nms=False,  # Class-agnostic NMS
+                    max_det=20  # Maximum detections per image
+                )
+                
+                if not results or len(results) == 0:
+                    return None
+                
+                # Extract bounding boxes with improved filtering
+                boxes = []
+                for result in results:
+                    if result.boxes is not None and len(result.boxes) > 0:
+                        for box in result.boxes:
+                            # Get box coordinates in xyxy format
+                            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                            confidence = box.conf[0].cpu().numpy()
+                            
+                            # Calculate box area for filtering tiny detections
+                            box_width = x2 - x1
+                            box_height = y2 - y1
+                            box_area = box_width * box_height
+                            
+                            # Filter by confidence and minimum size
+                            if (confidence >= confidence_threshold and 
+                                box_width > 20 and box_height > 20 and 
+                                box_area > 400):  # Minimum face area
+                                boxes.append([x1, y1, x2, y2])
+                
+                return np.array(boxes) if boxes else None
+            
+            else:
+                # Fallback to OpenCV Haar Cascades with improved parameters
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+                
+                # Apply histogram equalization for better detection
+                gray = cv2.equalizeHist(gray)
+                
+                # Detect faces with multiple scale factors for better accuracy
+                faces = self.face_cascade.detectMultiScale(
+                    gray, 
+                    scaleFactor=1.05,  # Smaller scale factor for better detection
+                    minNeighbors=6,    # Higher neighbors for fewer false positives
+                    minSize=(30, 30),
+                    maxSize=(300, 300),
+                    flags=cv2.CASCADE_SCALE_IMAGE
+                )
+                
+                if len(faces) == 0:
+                    return None
+                
+                # Convert from (x, y, w, h) to (x1, y1, x2, y2) format
+                boxes = []
+                for (x, y, w, h) in faces:
+                    boxes.append([x, y, x + w, y + h])
+                
+                return np.array(boxes)
+            
+        except Exception as e:
+            logger.error(f"Error in face detection: {e}")
+            return None
     
     def get_embedding(self, face_bgr: np.ndarray) -> Optional[np.ndarray]:
         """
@@ -184,8 +303,8 @@ class FaceRecognitionModel:
                 logger.error(f"Failed to load image: {image_path}")
                 return False
             
-            # Detect faces
-            boxes, _ = self.mtcnn.detect(img)
+            # Detect faces using YOLO with improved accuracy
+            boxes = self.detect_faces(img, confidence_threshold=0.3)
             if boxes is None or len(boxes) == 0:
                 logger.error(f"No faces detected in {image_path}")
                 return False
@@ -332,8 +451,8 @@ class FaceRecognitionModel:
                         # Resize frame for faster processing
                         small_frame = cv2.resize(frame, (process_width, process_height))
                         
-                        # Detect faces on smaller frame
-                        boxes, _ = self.mtcnn.detect(small_frame)
+                        # Detect faces using YOLO on smaller frame with improved accuracy
+                        boxes = self.detect_faces(small_frame, confidence_threshold=0.3)
                         
                         # Scale boxes back to original size
                         current_detections = []
@@ -466,8 +585,8 @@ class FaceRecognitionModel:
             faces_detected = 0
             recognized_faces = set()
             
-            # Detect faces
-            boxes, _ = self.mtcnn.detect(img)
+            # Detect faces using YOLO with improved accuracy
+            boxes = self.detect_faces(img, confidence_threshold=0.3)
             
             if boxes is not None:
                 for box in boxes:
@@ -734,7 +853,182 @@ class FaceRecognitionModel:
             logger.error(f"Error saving face image: {e}")
             return False
 
+    def assess_face_quality(self, face_image: np.ndarray) -> Dict[str, Any]:
+        """
+        Assess the quality of a face image for better recognition
+        
+        Args:
+            face_image: Face image as numpy array
+            
+        Returns:
+            Dictionary with quality metrics
+        """
+        try:
+            gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
+            
+            # Calculate blur (Laplacian variance)
+            blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+            
+            # Calculate brightness
+            brightness = np.mean(gray)
+            
+            # Calculate contrast (standard deviation)
+            contrast = np.std(gray)
+            
+            # Calculate image resolution quality
+            height, width = face_image.shape[:2]
+            resolution_score = height * width
+            
+            # Overall quality score (normalized)
+            quality_score = (
+                min(blur_score / 100, 1.0) * 0.4 +  # Blur weight
+                min(abs(brightness - 128) / 128, 1.0) * 0.2 +  # Brightness weight
+                min(contrast / 50, 1.0) * 0.2 +  # Contrast weight
+                min(resolution_score / 10000, 1.0) * 0.2  # Resolution weight
+            )
+            
+            return {
+                'blur_score': float(blur_score),
+                'brightness': float(brightness),
+                'contrast': float(contrast),
+                'resolution': [int(width), int(height)],
+                'quality_score': float(quality_score),
+                'is_good_quality': quality_score > 0.6
+            }
+            
+        except Exception as e:
+            logger.error(f"Error assessing face quality: {e}")
+            return {
+                'blur_score': 0.0,
+                'brightness': 0.0,
+                'contrast': 0.0,
+                'resolution': [0, 0],
+                'quality_score': 0.0,
+                'is_good_quality': False
+            }
+
+    def get_face_landmarks(self, face_image: np.ndarray) -> Optional[np.ndarray]:
+        """
+        Extract facial landmarks for pose estimation
+        
+        Args:
+            face_image: Face image as numpy array
+            
+        Returns:
+            Facial landmarks array or None
+        """
+        try:
+            # This is a placeholder for facial landmark detection
+            # You can integrate dlib or mediapipe for better landmark detection
+            gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
+            
+            # For now, return basic face center and estimated landmarks
+            h, w = gray.shape
+            center_x, center_y = w // 2, h // 2
+            
+            # Estimated landmark positions (eyes, nose, mouth)
+            landmarks = np.array([
+                [center_x - w//4, center_y - h//4],  # Left eye
+                [center_x + w//4, center_y - h//4],  # Right eye
+                [center_x, center_y],                # Nose
+                [center_x - w//6, center_y + h//4], # Left mouth corner
+                [center_x + w//6, center_y + h//4], # Right mouth corner
+            ])
+            
+            return landmarks
+            
+        except Exception as e:
+            logger.error(f"Error extracting landmarks: {e}")
+            return None
+
+    def detect_face_attributes(self, face_image: np.ndarray) -> Dict[str, Any]:
+        """
+        Detect basic face attributes like estimated age, gender, emotion
+        
+        Args:
+            face_image: Face image as numpy array
+            
+        Returns:
+            Dictionary with estimated attributes
+        """
+        try:
+            # This is a basic implementation
+            # For production, integrate with specialized models
+            
+            gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
+            
+            # Basic heuristics (placeholder implementation)
+            brightness = np.mean(gray)
+            
+            # Estimate based on image characteristics
+            estimated_age = "Unknown"
+            estimated_gender = "Unknown"
+            estimated_emotion = "Neutral"
+            
+            # Simple brightness-based emotion estimation
+            if brightness > 150:
+                estimated_emotion = "Happy"
+            elif brightness < 100:
+                estimated_emotion = "Serious"
+            
+            return {
+                'estimated_age': estimated_age,
+                'estimated_gender': estimated_gender,
+                'estimated_emotion': estimated_emotion,
+                'confidence': 0.5  # Low confidence for basic implementation
+            }
+            
+        except Exception as e:
+            logger.error(f"Error detecting face attributes: {e}")
+            return {
+                'estimated_age': "Unknown",
+                'estimated_gender': "Unknown", 
+                'estimated_emotion': "Unknown",
+                'confidence': 0.0
+            }
+
     def update_recognition_count(self, person_id: str) -> bool:
+        """
+        Update the recognition count for a person
+        
+        Args:
+            person_id: Person ID to update
+            
+        Returns:
+            True if update successful, False otherwise
+        """
+        try:
+            faces_dir = Path("enrolled_faces")
+            metadata_file = faces_dir / "metadata.json"
+            
+            if not metadata_file.exists():
+                return False
+            
+            # Load metadata
+            metadata = {}
+            try:
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    metadata = json.load(f)
+            except:
+                return False
+            
+            if person_id in metadata:
+                # Increment recognition count
+                metadata[person_id]["times_recognized"] = metadata[person_id].get("times_recognized", 0) + 1
+                metadata[person_id]["last_recognized"] = datetime.now().isoformat()
+                
+                # Save updated metadata
+                with open(metadata_file, 'w', encoding='utf-8') as f:
+                    json.dump(metadata, f, indent=2)
+                
+                return True
+            
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error updating recognition count: {e}")
+            return False
         """
         Update the recognition count for a person
         
