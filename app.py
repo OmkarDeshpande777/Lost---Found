@@ -11,6 +11,7 @@ import json
 from werkzeug.utils import secure_filename
 import torch
 import cv2
+import numpy as np
 
 # Import our face recognition model
 from model3 import FaceRecognitionModel
@@ -351,8 +352,8 @@ def update_face_image(face_id):
                 if img is None:
                     return jsonify({'success': False, 'message': 'Invalid image file'}), 400
 
-                # Detect faces
-                boxes, _ = face_model.mtcnn.detect(img)
+                # Detect faces using YOLO with improved accuracy
+                boxes = face_model.detect_faces(img, confidence_threshold=0.3)
                 if boxes is None or len(boxes) == 0:
                     return jsonify({'success': False, 'message': 'No faces detected in image'}), 400
 
@@ -584,8 +585,8 @@ def camera_stream():
                 # Process face recognition every nth frame
                 if frame_count % process_every_n_frames == 0 and face_model:
                     try:
-                        # Detect faces
-                        boxes, _ = face_model.mtcnn.detect(frame)
+                        # Detect faces using YOLO with improved accuracy
+                        boxes = face_model.detect_faces(frame, confidence_threshold=0.3)
                         
                         if boxes is not None and len(boxes) > 0:
                             current_faces = []
@@ -713,7 +714,7 @@ def camera_stream():
 # 🚀 FEATURE 2: Batch Processing Multiple Files
 @app.route('/api/batch-process', methods=['POST'])
 def batch_process():
-    """Process multiple files at once"""
+    """Process multiple files at once with improved handling"""
     if not face_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
@@ -723,49 +724,509 @@ def batch_process():
             return jsonify({'success': False, 'message': 'No files provided'}), 400
         
         results = []
-        for file in files:
+        processed_count = 0
+        failed_count = 0
+        
+        for i, file in enumerate(files):
             if file.filename and allowed_file(file.filename):
-                # Process each file
-                filename = secure_filename(f"batch_{uuid.uuid4().hex}.{file.filename.rsplit('.', 1)[1].lower()}")
-                input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-                file.save(input_path)
-                
-                output_filename = f"batch_output_{uuid.uuid4().hex}.{'mp4' if is_video(file.filename) else 'jpg'}"
-                output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
-                
                 try:
+                    # Process each file
+                    filename = secure_filename(f"batch_{uuid.uuid4().hex}.{file.filename.rsplit('.', 1)[1].lower()}")
+                    input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                    file.save(input_path)
+                    
+                    output_filename = f"batch_output_{uuid.uuid4().hex}.{'mp4' if is_video(file.filename) else 'jpg'}"
+                    output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
+                    
+                    logger.info(f"Processing batch file {i+1}/{len(files)}: {file.filename}")
+                    
                     if is_video(file.filename):
-                        result_path, stats = face_model.process_video(input_path, output_path, 10, 0.3)  # More aggressive optimization for batch
+                        # More conservative settings for batch processing
+                        result_path, stats = face_model.process_video(
+                            input_path, 
+                            output_path, 
+                            skip_frames=8,  # Process every 8th frame for speed
+                            resize_factor=0.4  # Smaller resize for faster processing
+                        )
                     else:
                         result_path, stats = face_model.process_image(input_path, output_path)
                     
-                    results.append({
-                        'filename': file.filename,
-                        'output_path': f'/outputs/{output_filename}',
-                        'statistics': stats,
-                        'success': True
-                    })
-                    
-                    # Clean up input
-                    if os.path.exists(input_path):
-                        os.remove(input_path)
+                    # Verify the output file was created
+                    if os.path.exists(output_path):
+                        file_size = os.path.getsize(output_path)
+                        results.append({
+                            'filename': file.filename,
+                            'output_path': f'/outputs/{output_filename}',
+                            'output_filename': output_filename,
+                            'statistics': stats,
+                            'file_size': file_size,
+                            'success': True
+                        })
+                        processed_count += 1
+                        logger.info(f"✅ Successfully processed: {file.filename}")
+                    else:
+                        raise Exception("Output file was not created")
                         
                 except Exception as e:
+                    failed_count += 1
+                    error_msg = str(e)
+                    logger.error(f"❌ Failed to process {file.filename}: {error_msg}")
                     results.append({
                         'filename': file.filename,
-                        'error': str(e),
+                        'error': error_msg,
                         'success': False
                     })
+                
+                finally:
+                    # Clean up input file
+                    if 'input_path' in locals() and os.path.exists(input_path):
+                        try:
+                            os.remove(input_path)
+                        except:
+                            pass
+            else:
+                failed_count += 1
+                results.append({
+                    'filename': file.filename if file.filename else 'Unknown',
+                    'error': 'Invalid file type or no filename',
+                    'success': False
+                })
         
         return jsonify({
             'success': True,
-            'message': f'Processed {len(results)} files',
+            'message': f'Batch processing completed: {processed_count} succeeded, {failed_count} failed',
+            'processed_count': processed_count,
+            'failed_count': failed_count,
+            'total_files': len(files),
             'results': results
         })
         
     except Exception as e:
         logger.error(f"Error in batch processing: {e}")
         return jsonify({'success': False, 'message': f'Batch processing error: {str(e)}'}), 500
+
+# 🚀 NEW FEATURE: Face Quality Assessment
+@app.route('/api/assess-face-quality', methods=['POST'])
+def assess_face_quality():
+    """Assess the quality of uploaded face images"""
+    if not face_model:
+        return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
+    
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'message': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if not file.filename or not allowed_file(file.filename):
+            return jsonify({'success': False, 'message': 'Invalid file type'}), 400
+        
+        # Save temporarily
+        filename = secure_filename(f"temp_quality_{uuid.uuid4().hex}.{file.filename.rsplit('.', 1)[1].lower()}")
+        temp_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(temp_path)
+        
+        try:
+            # Load image
+            img = cv2.imread(temp_path)
+            if img is None:
+                return jsonify({'success': False, 'message': 'Invalid image file'}), 400
+            
+            # Detect faces
+            boxes = face_model.detect_faces(img, confidence_threshold=0.3)
+            if boxes is None or len(boxes) == 0:
+                return jsonify({'success': False, 'message': 'No faces detected in image'}), 400
+            
+            # Assess quality for each detected face
+            face_qualities = []
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = map(int, box)
+                face_crop = img[y1:y2, x1:x2]
+                
+                quality_metrics = face_model.assess_face_quality(face_crop)
+                landmarks = face_model.get_face_landmarks(face_crop)
+                attributes = face_model.detect_face_attributes(face_crop)
+                
+                face_qualities.append({
+                    'face_index': i,
+                    'bounding_box': [x1, y1, x2, y2],
+                    'quality_metrics': quality_metrics,
+                    'attributes': attributes,
+                    'has_landmarks': landmarks is not None
+                })
+            
+            return jsonify({
+                'success': True,
+                'faces_detected': len(boxes),
+                'face_qualities': face_qualities,
+                'recommendations': generate_quality_recommendations(face_qualities)
+            })
+            
+        finally:
+            # Clean up
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
+    except Exception as e:
+        logger.error(f"Error in face quality assessment: {e}")
+        return jsonify({'success': False, 'message': f'Quality assessment error: {str(e)}'}), 500
+
+def generate_quality_recommendations(face_qualities):
+    """Generate recommendations based on face quality assessment"""
+    recommendations = []
+    
+    for face in face_qualities:
+        quality = face['quality_metrics']
+        face_recs = []
+        
+        if quality['blur_score'] < 50:
+            face_recs.append("Image appears blurry - try using a steadier camera or better lighting")
+        
+        if quality['brightness'] < 80:
+            face_recs.append("Image is too dark - increase lighting or camera exposure")
+        elif quality['brightness'] > 180:
+            face_recs.append("Image is too bright - reduce lighting or camera exposure")
+        
+        if quality['contrast'] < 30:
+            face_recs.append("Low contrast - try different lighting conditions")
+        
+        resolution = quality['resolution']
+        if resolution[0] < 100 or resolution[1] < 100:
+            face_recs.append("Face resolution is low - move closer or use higher resolution camera")
+        
+        if not face_recs:
+            face_recs.append("Good quality image for face recognition")
+        
+        recommendations.append({
+            'face_index': face['face_index'],
+            'recommendations': face_recs
+        })
+    
+    return recommendations
+
+# 🚀 NEW FEATURE: Face Comparison
+@app.route('/api/compare-faces', methods=['POST'])
+def compare_faces():
+    """Compare two face images for similarity"""
+    if not face_model:
+        return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
+    
+    try:
+        if 'file1' not in request.files or 'file2' not in request.files:
+            return jsonify({'success': False, 'message': 'Two files required for comparison'}), 400
+        
+        file1 = request.files['file1']
+        file2 = request.files['file2']
+        
+        if not (file1.filename and file2.filename and 
+                allowed_file(file1.filename) and allowed_file(file2.filename)):
+            return jsonify({'success': False, 'message': 'Invalid file types'}), 400
+        
+        # Process both images
+        def process_face_image(file, suffix):
+            filename = secure_filename(f"temp_compare_{suffix}_{uuid.uuid4().hex}.{file.filename.rsplit('.', 1)[1].lower()}")
+            temp_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(temp_path)
+            
+            img = cv2.imread(temp_path)
+            os.remove(temp_path)  # Clean up immediately
+            
+            if img is None:
+                raise ValueError(f"Invalid image file: {file.filename}")
+            
+            boxes = face_model.detect_faces(img, confidence_threshold=0.3)
+            if boxes is None or len(boxes) == 0:
+                raise ValueError(f"No faces detected in: {file.filename}")
+            
+            # Use first detected face
+            x1, y1, x2, y2 = map(int, boxes[0])
+            face_crop = img[y1:y2, x1:x2]
+            embedding = face_model.get_embedding(face_crop)
+            
+            if embedding is None:
+                raise ValueError(f"Could not extract embedding from: {file.filename}")
+            
+            return embedding, face_crop
+        
+        # Get embeddings for both faces
+        embedding1, face1_crop = process_face_image(file1, "1")
+        embedding2, face2_crop = process_face_image(file2, "2")
+        
+        # Calculate similarity (cosine similarity)
+        similarity = np.dot(embedding1, embedding2) / (np.linalg.norm(embedding1) * np.linalg.norm(embedding2))
+        
+        # Convert to percentage and determine match
+        similarity_percentage = float(similarity * 100)
+        is_match = similarity > face_model.threshold
+        confidence_level = "High" if similarity > 0.8 else "Medium" if similarity > 0.6 else "Low"
+        
+        return jsonify({
+            'success': True,
+            'similarity_score': round(similarity_percentage, 2),
+            'is_match': is_match,
+            'confidence_level': confidence_level,
+            'threshold_used': face_model.threshold,
+            'file1_name': file1.filename,
+            'file2_name': file2.filename
+        })
+        
+    except ValueError as ve:
+        return jsonify({'success': False, 'message': str(ve)}), 400
+    except Exception as e:
+        logger.error(f"Error in face comparison: {e}")
+        return jsonify({'success': False, 'message': f'Face comparison error: {str(e)}'}), 500
+
+# 🚀 NEW FEATURE: Advanced Search
+@app.route('/api/search-faces', methods=['POST'])
+def search_faces():
+    """Search for similar faces in the database"""
+    if not face_model:
+        return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
+    
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'message': 'No file provided'}), 400
+        
+        file = request.files['file']
+        if not file.filename or not allowed_file(file.filename):
+            return jsonify({'success': False, 'message': 'Invalid file type'}), 400
+        
+        # Get search parameters
+        top_k = int(request.form.get('top_k', 5))  # Return top 5 matches by default
+        min_confidence = float(request.form.get('min_confidence', 0.3))
+        
+        # Save temporarily and process
+        filename = secure_filename(f"temp_search_{uuid.uuid4().hex}.{file.filename.rsplit('.', 1)[1].lower()}")
+        temp_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(temp_path)
+        
+        try:
+            # Load and process image
+            img = cv2.imread(temp_path)
+            if img is None:
+                return jsonify({'success': False, 'message': 'Invalid image file'}), 400
+            
+            # Detect faces
+            boxes = face_model.detect_faces(img, confidence_threshold=0.3)
+            if boxes is None or len(boxes) == 0:
+                return jsonify({'success': False, 'message': 'No faces detected in image'}), 400
+            
+            # Process first detected face
+            x1, y1, x2, y2 = map(int, boxes[0])
+            face_crop = img[y1:y2, x1:x2]
+            embedding = face_model.get_embedding(face_crop)
+            
+            if embedding is None:
+                return jsonify({'success': False, 'message': 'Could not extract face embedding'}), 400
+            
+            # Search in Pinecone database
+            query_result = face_model.index.query(
+                vector=embedding.tolist(),
+                top_k=top_k,
+                include_metadata=True
+            )
+            
+            # Format results
+            matches = []
+            for match in query_result['matches']:
+                score = match['score']
+                if score >= min_confidence:
+                    metadata = match.get('metadata', {})
+                    matches.append({
+                        'person_id': match['id'],
+                        'name': metadata.get('name', 'Unknown'),
+                        'similarity_score': round(score * 100, 2),
+                        'confidence_level': "High" if score > 0.8 else "Medium" if score > 0.6 else "Low",
+                        'image_path': metadata.get('image_path', ''),
+                        'metadata': metadata
+                    })
+            
+            return jsonify({
+                'success': True,
+                'total_matches': len(matches),
+                'matches': matches,
+                'search_parameters': {
+                    'top_k': top_k,
+                    'min_confidence': min_confidence
+                }
+            })
+            
+        finally:
+            # Clean up
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+                
+    except Exception as e:
+        logger.error(f"Error in face search: {e}")
+        return jsonify({'success': False, 'message': f'Face search error: {str(e)}'}), 500
+
+# 🚀 NEW FEATURE: Database Statistics and Management
+@app.route('/api/database-stats', methods=['GET'])
+def get_database_stats():
+    """Get comprehensive database statistics"""
+    if not face_model:
+        return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
+    
+    try:
+        # Get Pinecone stats
+        index_stats = face_model.index.describe_index_stats()
+        
+        # Get enrolled faces data
+        faces_data = face_model.get_enrolled_faces()
+        
+        # Calculate additional statistics
+        faces = faces_data.get('faces', [])
+        total_recognitions = sum(face.get('times_recognized', 0) for face in faces)
+        active_faces = len([face for face in faces if face.get('times_recognized', 0) > 0])
+        
+        # Calculate recognition frequency
+        recognition_stats = {}
+        for face in faces:
+            times_recognized = face.get('times_recognized', 0)
+            if times_recognized > 0:
+                if times_recognized not in recognition_stats:
+                    recognition_stats[times_recognized] = 0
+                recognition_stats[times_recognized] += 1
+        
+        # Most recognized faces
+        most_recognized = sorted(faces, key=lambda x: x.get('times_recognized', 0), reverse=True)[:5]
+        
+        return jsonify({
+            'success': True,
+            'database_stats': {
+                'total_faces': len(faces),
+                'active_faces': active_faces,
+                'inactive_faces': len(faces) - active_faces,
+                'total_recognitions': total_recognitions,
+                'average_recognitions_per_face': round(total_recognitions / max(len(faces), 1), 2),
+                'vector_count': index_stats.total_vector_count,
+                'index_dimension': 512,
+                'recognition_frequency': recognition_stats,
+                'most_recognized_faces': [
+                    {
+                        'name': face.get('name', 'Unknown'),
+                        'id': face.get('id', ''),
+                        'times_recognized': face.get('times_recognized', 0)
+                    } for face in most_recognized
+                ]
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting database stats: {e}")
+        return jsonify({'success': False, 'message': f'Database stats error: {str(e)}'}), 500
+
+# 🚀 NEW FEATURE: Bulk Face Management
+@app.route('/api/bulk-delete-faces', methods=['POST'])
+def bulk_delete_faces():
+    """Delete multiple faces from the database"""
+    if not face_model:
+        return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
+    
+    try:
+        data = request.get_json()
+        if not data or 'face_ids' not in data:
+            return jsonify({'success': False, 'message': 'No face IDs provided'}), 400
+        
+        face_ids = data['face_ids']
+        if not isinstance(face_ids, list):
+            return jsonify({'success': False, 'message': 'face_ids must be a list'}), 400
+        
+        deleted_count = 0
+        failed_deletions = []
+        
+        for face_id in face_ids:
+            try:
+                if face_model.delete_face(face_id):
+                    deleted_count += 1
+                    logger.info(f"Deleted face: {face_id}")
+                else:
+                    failed_deletions.append(face_id)
+            except Exception as e:
+                failed_deletions.append(face_id)
+                logger.error(f"Failed to delete face {face_id}: {e}")
+        
+        return jsonify({
+            'success': True,
+            'deleted_count': deleted_count,
+            'failed_count': len(failed_deletions),
+            'failed_deletions': failed_deletions,
+            'message': f'Successfully deleted {deleted_count} faces'
+        })
+        
+    except Exception as e:
+        logger.error(f"Error in bulk delete: {e}")
+        return jsonify({'success': False, 'message': f'Bulk delete error: {str(e)}'}), 500
+
+# 🚀 NEW FEATURE: System Health Monitoring
+@app.route('/api/system-health', methods=['GET'])
+def get_system_health():
+    """Get comprehensive system health information"""
+    try:
+        # Check disk space
+        uploads_dir = Path(app.config['UPLOAD_FOLDER'])
+        outputs_dir = Path(app.config['OUTPUT_FOLDER'])
+        faces_dir = Path("enrolled_faces")
+        
+        def get_folder_size(folder_path):
+            if folder_path.exists():
+                return sum(f.stat().st_size for f in folder_path.rglob('*') if f.is_file())
+            return 0
+        
+        uploads_size = get_folder_size(uploads_dir)
+        outputs_size = get_folder_size(outputs_dir)
+        faces_size = get_folder_size(faces_dir)
+        
+        # Check GPU status
+        gpu_available = torch.cuda.is_available()
+        gpu_info = {}
+        if gpu_available:
+            gpu_info = {
+                'name': torch.cuda.get_device_name(0),
+                'memory_total': torch.cuda.get_device_properties(0).total_memory,
+                'memory_allocated': torch.cuda.memory_allocated(0),
+                'memory_cached': torch.cuda.memory_reserved(0)
+            }
+        
+        # Check model status
+        model_status = {
+            'face_model_loaded': face_model is not None,
+            'yolo_model_active': face_model.yolo_model is not None if face_model else False,
+            'pinecone_connected': True if face_model else False
+        }
+        
+        # File counts
+        file_counts = {
+            'uploaded_files': len(list(uploads_dir.glob('*'))) if uploads_dir.exists() else 0,
+            'output_files': len(list(outputs_dir.glob('*'))) if outputs_dir.exists() else 0,
+            'enrolled_faces': len(list(faces_dir.glob('*.jpg'))) if faces_dir.exists() else 0
+        }
+        
+        return jsonify({
+            'success': True,
+            'system_health': {
+                'timestamp': datetime.now().isoformat(),
+                'gpu_status': {
+                    'available': gpu_available,
+                    'info': gpu_info
+                },
+                'model_status': model_status,
+                'storage': {
+                    'uploads_size_mb': round(uploads_size / (1024*1024), 2),
+                    'outputs_size_mb': round(outputs_size / (1024*1024), 2),
+                    'faces_size_mb': round(faces_size / (1024*1024), 2),
+                    'total_size_mb': round((uploads_size + outputs_size + faces_size) / (1024*1024), 2)
+                },
+                'file_counts': file_counts,
+                'performance': {
+                    'device': str(face_model.device) if face_model else 'Unknown',
+                    'model_type': 'YOLO8n + FaceNet' if face_model else 'Not loaded'
+                }
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Error getting system health: {e}")
+        return jsonify({'success': False, 'message': f'System health error: {str(e)}'}), 500
 
 # 🚀 FEATURE 3: Face Analytics and Statistics
 @app.route('/api/analytics', methods=['GET'])
@@ -1066,7 +1527,7 @@ def output_file(filename):
         return jsonify({'error': 'File not found'}), 404
     
     # For video files, support range requests for better streaming
-    if filename.endswith('.mp4'):
+    if filename.lower().endswith(('.mp4', '.avi', '.mov', '.wmv')):
         file_size = os.path.getsize(file_path)
         
         # Handle range requests for video streaming
@@ -1104,6 +1565,8 @@ def output_file(filename):
                     'Accept-Ranges': 'bytes',
                     'Content-Length': str(content_length),
                     'Content-Type': 'video/mp4',
+                    'Cache-Control': 'no-cache',
+                    'X-Content-Type-Options': 'nosniff'
                 }
             )
             return response
@@ -1119,16 +1582,20 @@ def output_file(filename):
             
             response = Response(
                 generate(),
-                mimetype='video/mp4',
+                200,
                 headers={
                     'Accept-Ranges': 'bytes',
                     'Content-Length': str(file_size),
-                    'Content-Type': 'video/mp4'
+                    'Content-Type': 'video/mp4',
+                    'Cache-Control': 'no-cache',
+                    'X-Content-Type-Options': 'nosniff'
                 }
             )
             return response
     else:
+        # For image files
         response = send_from_directory(app.config['OUTPUT_FOLDER'], filename)
+        response.headers['Cache-Control'] = 'no-cache'
         return response
 
 @app.route('/api/download/<filename>')
