@@ -57,7 +57,8 @@ class FaceRecognitionModel:
         self.pc = Pinecone(api_key=pinecone_api_key)
         self.INDEX_NAME = "face-recognition-index"
         self.EMBEDDING_DIM = 512
-        self.threshold = 0.6
+        self.threshold = 0.55  # Lowered threshold for better recognition like model4.py
+        self.feature_extractor_type = "facenet"  # For compatibility with app.py
         
         self._setup_pinecone()
         self._load_models()
@@ -95,7 +96,7 @@ class FaceRecognitionModel:
             ).eval().to(self.device)
             
             # Face detection model (YOLO8n)
-            yolo_model_path = r"C:\Document Local\Projects\Lost & Found\Models\Face_Detectbest.pt"
+            yolo_model_path = r"C:\Document Local\Projects\Lost & Found\.git\Models\best.pt"
             if not os.path.exists(yolo_model_path):
                 raise FileNotFoundError(f"YOLO model not found at: {yolo_model_path}")
             
@@ -347,7 +348,7 @@ class FaceRecognitionModel:
     
     def recognize_face(self, face_embedding: np.ndarray) -> Tuple[str, float]:
         """
-        Recognize a face from its embedding
+        Recognize a face from its embedding with improved accuracy
         
         Args:
             face_embedding: Face embedding vector
@@ -356,10 +357,10 @@ class FaceRecognitionModel:
             Tuple of (recognized_name, confidence_score)
         """
         try:
-            # Query Pinecone
+            # Query Pinecone with enhanced parameters for better accuracy
             query_result = self.index.query(
                 vector=face_embedding.tolist(), 
-                top_k=1, 
+                top_k=3,  # Get top 3 matches for better analysis
                 include_metadata=True
             )
             
@@ -368,9 +369,18 @@ class FaceRecognitionModel:
                 score = best_match['score']
                 metadata = best_match.get('metadata', {})
                 
-                if score > self.threshold:
+                # Use a lower threshold for better recognition (like model4.py)
+                recognition_threshold = 0.55  # Lowered from 0.6 for better accuracy
+                
+                if score > recognition_threshold:
                     name = metadata.get('name', "Unknown")
+                    # Update recognition count
+                    person_id = best_match['id']
+                    self.update_recognition_count(person_id)
+                    logger.info(f"✅ Recognized: {name} (score: {score:.3f})")
                     return name, score
+                else:
+                    logger.debug(f"⚠️ Low confidence match: {score:.3f} < {recognition_threshold}")
             
             return "Unknown", 0.0
             
