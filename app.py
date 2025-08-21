@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import uuid
+import tempfile
 from datetime import datetime
 import logging
 from pathlib import Path
@@ -13,8 +14,9 @@ import torch
 import cv2
 import numpy as np
 
-# Import our face recognition model
+# Import the enhanced FaceNet face recognition model (YOLO8n + FaceNet - Better performance)
 from model3 import FaceRecognitionModel
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -46,11 +48,20 @@ if not PINECONE_API_KEY or PINECONE_API_KEY == 'your-pinecone-api-key-here':
     face_model = None
 else:
     try:
+        # Initialize the enhanced YOLO8n + FaceNet model only
         face_model = FaceRecognitionModel(pinecone_api_key=PINECONE_API_KEY)
-        logger.info("✅ Face recognition model initialized successfully with GPU support")
+        logger.info("✅ Enhanced YOLO8n + FaceNet model initialized successfully")
+        
     except Exception as e:
-        logger.error(f"❌ Failed to initialize face recognition model: {e}")
+        logger.error(f"❌ Failed to initialize enhanced face recognition model: {e}")
         face_model = None
+
+# Global variable to track model type (always enhanced now)
+current_model_type = "enhanced"  # Only enhanced model supported
+
+def get_current_model():
+    """Get the current active model (always enhanced DINOv3 model)"""
+    return face_model
 
 # Allowed file extensions
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'mp4', 'avi', 'mov', 'wmv'}
@@ -115,16 +126,79 @@ def health_check():
     return jsonify({
         'status': 'healthy',
         'model_loaded': face_model is not None,
+        'model_type': 'YOLO8n + FaceNet Enhanced',
+        'current_model': current_model_type,
         'timestamp': datetime.now().isoformat(),
         'gpu_info': gpu_info,
         'python_version': f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
         'torch_version': torch.__version__
     })
 
+@app.route('/api/model-info', methods=['GET'])
+def get_model_info():
+    """Get information about the enhanced YOLO8n + FaceNet model"""
+    model_info = {
+        'current_model': current_model_type,
+        'model_details': {
+            'name': 'YOLO8n + FaceNet Enhanced',
+            'description': 'State-of-the-art face recognition using YOLO8n for detection and FaceNet for embeddings',
+            'loaded': face_model is not None,
+            'embedding_dim': current_model.EMBEDDING_DIM if face_model else None,
+            'model_type': current_model.feature_extractor_type if face_model else None,
+            'detection_model': 'YOLO8n Custom Trained',
+            'embedding_model': 'FaceNet (InceptionResnetV1)'
+        },
+        'capabilities': [
+            'GPU-accelerated processing',
+            'High-accuracy face detection',
+            'Superior feature extraction with DINOv3',
+            'Self-supervised learned representations',
+            'Robust to lighting and pose variations'
+        ]
+    }
+    return jsonify(model_info)
+
+@app.route('/api/switch-model', methods=['POST'])
+def switch_model():
+    """Model switching endpoint (only enhanced model available)"""
+    global current_model_type
+    
+    data = request.get_json()
+    if not data or 'model_type' not in data:
+        return jsonify({'success': False, 'message': 'Model type not specified'}), 400
+    
+    new_model_type = data['model_type']
+    
+    # Only enhanced model is available
+    if new_model_type != 'enhanced':
+        return jsonify({
+            'success': False, 
+            'message': 'Only enhanced YOLO8n + FaceNet model is available',
+            'available_models': ['enhanced']
+        }), 400
+    
+    # Check if model is available
+    if face_model is None:
+        return jsonify({'success': False, 'message': 'Enhanced model not initialized'}), 500
+    
+    current_model_type = new_model_type
+    
+    return jsonify({
+        'success': True, 
+        'message': f'Using enhanced YOLO8n + FaceNet model',
+        'current_model': current_model_type,
+        'model_details': {
+            'detection': 'YOLO8n',
+            'embeddings': 'DINOv3',
+            'embedding_dim': current_model.EMBEDDING_DIM if face_model else None
+        }
+    })
+
 @app.route('/api/enroll', methods=['POST'])
 def enroll_face():
     """Enroll a new face"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
 
     try:
@@ -153,7 +227,7 @@ def enroll_face():
         logger.info(f"Processing enrollment for {person_name} (ID: {person_id})")
 
         # Enroll face
-        success = face_model.enroll_face(filepath, person_id, person_name)
+        success = current_model.enroll_face(filepath, person_id, person_name)
         
         if success:
             return jsonify({
@@ -175,7 +249,8 @@ def enroll_face():
 @app.route('/api/process', methods=['POST'])
 def process_media():
     """Process image or video for face recognition"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
 
     try:
@@ -220,7 +295,7 @@ def process_media():
                 skip_frames = int(request.form.get('skip_frames', 5))  # Process every 5th frame by default
                 resize_factor = float(request.form.get('resize_factor', 0.5))  # 50% size by default
             
-            result_path, stats = face_model.process_video(input_path, output_path, skip_frames, resize_factor)
+            result_path, stats = current_model.process_video(input_path, output_path, skip_frames, resize_factor)
             faces_detected = stats.get('faces_detected', 0)
             additional_info = {
                 'total_frames': stats.get('total_frames', 0),
@@ -230,7 +305,7 @@ def process_media():
                 'optimization': stats.get('optimization', '')
             }
         else:
-            result_path, stats = face_model.process_image(input_path, output_path)
+            result_path, stats = current_model.process_image(input_path, output_path)
             faces_detected = stats.get('faces_detected', 0)
             additional_info = {
                 'unique_people': stats.get('unique_people', 0),
@@ -260,12 +335,13 @@ def process_media():
 @app.route('/api/faces', methods=['GET'])
 def get_enrolled_faces():
     """Get list of enrolled faces with photos and metadata"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
 
     try:
         # Get enrolled faces info with images and metadata
-        faces_data = face_model.get_enrolled_faces()
+        faces_data = current_model.get_enrolled_faces()
         
         return jsonify({
             'success': True,
@@ -283,11 +359,12 @@ def get_enrolled_faces():
 @app.route('/api/faces/<face_id>', methods=['DELETE'])
 def delete_face(face_id):
     """Delete an enrolled face"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
 
     try:
-        success = face_model.delete_face(face_id)
+        success = current_model.delete_face(face_id)
         
         if success:
             return jsonify({
@@ -304,7 +381,8 @@ def delete_face(face_id):
 @app.route('/api/faces/<face_id>', methods=['PUT'])
 def update_face(face_id):
     """Update face metadata (name, confidence threshold)"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
 
     try:
@@ -312,7 +390,7 @@ def update_face(face_id):
         name = data.get('name')
         confidence_threshold = data.get('confidence_threshold')
         
-        success = face_model.update_face_metadata(face_id, name=name, confidence_threshold=confidence_threshold)
+        success = current_model.update_face_metadata(face_id, name=name, confidence_threshold=confidence_threshold)
         
         if success:
             return jsonify({
@@ -326,10 +404,102 @@ def update_face(face_id):
         logger.error(f"Error updating face: {e}")
         return jsonify({'success': False, 'message': f'Update failed: {str(e)}'}), 500
 
+@app.route('/api/database/cleanup', methods=['POST'])
+def cleanup_database():
+    """Clean up database inconsistencies and re-index with current embedding model"""
+    current_model = get_current_model()
+    if not current_model:
+        return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
+
+    try:
+        logger.info("🧹 Starting database cleanup...")
+        
+        # Check if the model has the cleanup method
+        if hasattr(current_model, 'clean_and_reindex_database'
+        ):
+            result = current_model.clean_and_reindex_database()
+            
+            if result.get('success', False):
+                return jsonify({
+                    'success': True,
+                    'message': 'Database cleanup completed successfully',
+                    'stats': result.get('stats', {}),
+                    'details': result.get('message', '')
+                })
+            else:
+                return jsonify({
+                    'success': False,
+                    'message': result.get('message', 'Cleanup failed'),
+                    'stats': result.get('stats', {})
+                }), 500
+        else:
+            return jsonify({
+                'success': False,
+                'message': 'Cleanup method not available in current model'
+            }), 500
+
+    except Exception as e:
+        logger.error(f"Error during database cleanup: {e}")
+        return jsonify({
+            'success': False, 
+            'message': f'Cleanup failed: {str(e)}'
+        }), 500
+
+@app.route('/api/faces/<face_id>/verify', methods=['POST'])
+def verify_face_similarity(face_id):
+    """Verify if an uploaded image matches the enrolled face"""
+    current_model = get_current_model()
+    if not current_model:
+        return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
+
+    try:
+        # Check if file was uploaded
+        if 'image' not in request.files:
+            return jsonify({'success': False, 'message': 'No image file provided'}), 400
+        
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({'success': False, 'message': 'No file selected'}), 400
+        
+        # Save uploaded file temporarily
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
+            file.save(temp_file.name)
+            temp_path = temp_file.name
+        
+        try:
+            # Verify face similarity
+            if hasattr(current_model, 'verify_face_similarity'):
+                result = current_model.verify_face_similarity(face_id, temp_path)
+                
+                return jsonify({
+                    'success': True,
+                    'verification_result': result
+                })
+            else:
+                return jsonify({
+                    'success': False,
+                    'message': 'Face verification not supported by current model'
+                }), 500
+        
+        finally:
+            # Clean up temporary file
+            try:
+                os.unlink(temp_path)
+            except:
+                pass
+
+    except Exception as e:
+        logger.error(f"Error in face verification: {e}")
+        return jsonify({
+            'success': False, 
+            'message': f'Verification failed: {str(e)}'
+        }), 500
+
 @app.route('/api/faces/<face_id>/image', methods=['POST'])
 def update_face_image(face_id):
     """Update face image"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
 
     try:
@@ -353,7 +523,7 @@ def update_face_image(face_id):
                     return jsonify({'success': False, 'message': 'Invalid image file'}), 400
 
                 # Detect faces using YOLO with improved accuracy
-                boxes = face_model.detect_faces(img, confidence_threshold=0.3)
+                boxes = current_model.detect_faces(img, confidence_threshold=0.3)
                 if boxes is None or len(boxes) == 0:
                     return jsonify({'success': False, 'message': 'No faces detected in image'}), 400
 
@@ -372,22 +542,22 @@ def update_face_image(face_id):
                 face_crop = img[y1:y2, x1:x2]
                 
                 # Get new embedding
-                embedding = face_model.get_embedding(face_crop)
+                embedding = current_model.get_embedding(face_crop)
                 if embedding is None:
                     return jsonify({'success': False, 'message': 'Failed to process face'}), 400
 
                 # Update in Pinecone (get existing metadata first)
-                query_result = face_model.index.query(id=face_id, top_k=1, include_metadata=True)
+                query_result = current_model.index.query(id=face_id, top_k=1, include_metadata=True)
                 if query_result.matches:
                     existing_metadata = query_result.matches[0].metadata
-                    face_model.index.upsert(vectors=[(
+                    current_model.index.upsert(vectors=[(
                         face_id, 
                         embedding.tolist(), 
                         existing_metadata
                     )])
                 
                 # Save new face image
-                face_model.save_face_image(face_id, face_crop)
+                current_model.save_face_image(face_id, face_crop)
                 
                 return jsonify({
                     'success': True,
@@ -414,11 +584,12 @@ def serve_face_image(filename):
 @app.route('/api/face-database')
 def get_face_database_info():
     """Get face database information for the frontend"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
 
     try:
-        faces_data = face_model.get_enrolled_faces()
+        faces_data = current_model.get_enrolled_faces()
         
         return jsonify({
             'success': True,
@@ -489,7 +660,8 @@ def start_camera():
     """Start real-time camera processing"""
     global camera_active, camera_cap
     
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
     try:
@@ -586,7 +758,7 @@ def camera_stream():
                 if frame_count % process_every_n_frames == 0 and face_model:
                     try:
                         # Detect faces using YOLO with improved accuracy
-                        boxes = face_model.detect_faces(frame, confidence_threshold=0.3)
+                        boxes = current_model.detect_faces(frame, confidence_threshold=0.3)
                         
                         if boxes is not None and len(boxes) > 0:
                             current_faces = []
@@ -610,10 +782,10 @@ def camera_stream():
                                     continue
                                 
                                 # Get embedding and recognize
-                                embedding = face_model.get_embedding(face_crop)
+                                embedding = current_model.get_embedding(face_crop)
                                 if embedding is not None:
                                     # Query Pinecone for similar faces
-                                    results = face_model.index.query(
+                                    results = current_model.index.query(
                                         vector=embedding.tolist(),
                                         top_k=1,
                                         include_metadata=True
@@ -632,7 +804,7 @@ def camera_stream():
                                             # Update recognition count (less frequently to avoid spam)
                                             if frame_count % 30 == 0:  # Once every 30 frames
                                                 face_id = match.id
-                                                face_model.update_recognition_count(face_id)
+                                                current_model.update_recognition_count(face_id)
                                     
                                     current_faces.append({
                                         'bbox': (x1, y1, x2, y2),
@@ -715,7 +887,8 @@ def camera_stream():
 @app.route('/api/batch-process', methods=['POST'])
 def batch_process():
     """Process multiple files at once with improved handling"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
     try:
@@ -742,14 +915,14 @@ def batch_process():
                     
                     if is_video(file.filename):
                         # More conservative settings for batch processing
-                        result_path, stats = face_model.process_video(
+                        result_path, stats = current_model.process_video(
                             input_path, 
                             output_path, 
                             skip_frames=8,  # Process every 8th frame for speed
                             resize_factor=0.4  # Smaller resize for faster processing
                         )
                     else:
-                        result_path, stats = face_model.process_image(input_path, output_path)
+                        result_path, stats = current_model.process_image(input_path, output_path)
                     
                     # Verify the output file was created
                     if os.path.exists(output_path):
@@ -809,7 +982,8 @@ def batch_process():
 @app.route('/api/assess-face-quality', methods=['POST'])
 def assess_face_quality():
     """Assess the quality of uploaded face images"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
     try:
@@ -832,7 +1006,7 @@ def assess_face_quality():
                 return jsonify({'success': False, 'message': 'Invalid image file'}), 400
             
             # Detect faces
-            boxes = face_model.detect_faces(img, confidence_threshold=0.3)
+            boxes = current_model.detect_faces(img, confidence_threshold=0.3)
             if boxes is None or len(boxes) == 0:
                 return jsonify({'success': False, 'message': 'No faces detected in image'}), 400
             
@@ -842,9 +1016,9 @@ def assess_face_quality():
                 x1, y1, x2, y2 = map(int, box)
                 face_crop = img[y1:y2, x1:x2]
                 
-                quality_metrics = face_model.assess_face_quality(face_crop)
-                landmarks = face_model.get_face_landmarks(face_crop)
-                attributes = face_model.detect_face_attributes(face_crop)
+                quality_metrics = current_model.assess_face_quality(face_crop)
+                landmarks = current_model.get_face_landmarks(face_crop)
+                attributes = current_model.detect_face_attributes(face_crop)
                 
                 face_qualities.append({
                     'face_index': i,
@@ -907,7 +1081,8 @@ def generate_quality_recommendations(face_qualities):
 @app.route('/api/compare-faces', methods=['POST'])
 def compare_faces():
     """Compare two face images for similarity"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
     try:
@@ -933,14 +1108,14 @@ def compare_faces():
             if img is None:
                 raise ValueError(f"Invalid image file: {file.filename}")
             
-            boxes = face_model.detect_faces(img, confidence_threshold=0.3)
+            boxes = current_model.detect_faces(img, confidence_threshold=0.3)
             if boxes is None or len(boxes) == 0:
                 raise ValueError(f"No faces detected in: {file.filename}")
             
             # Use first detected face
             x1, y1, x2, y2 = map(int, boxes[0])
             face_crop = img[y1:y2, x1:x2]
-            embedding = face_model.get_embedding(face_crop)
+            embedding = current_model.get_embedding(face_crop)
             
             if embedding is None:
                 raise ValueError(f"Could not extract embedding from: {file.filename}")
@@ -956,7 +1131,7 @@ def compare_faces():
         
         # Convert to percentage and determine match
         similarity_percentage = float(similarity * 100)
-        is_match = similarity > face_model.threshold
+        is_match = similarity > current_model.threshold
         confidence_level = "High" if similarity > 0.8 else "Medium" if similarity > 0.6 else "Low"
         
         return jsonify({
@@ -964,7 +1139,7 @@ def compare_faces():
             'similarity_score': round(similarity_percentage, 2),
             'is_match': is_match,
             'confidence_level': confidence_level,
-            'threshold_used': face_model.threshold,
+            'threshold_used': current_model.threshold,
             'file1_name': file1.filename,
             'file2_name': file2.filename
         })
@@ -979,7 +1154,8 @@ def compare_faces():
 @app.route('/api/search-faces', methods=['POST'])
 def search_faces():
     """Search for similar faces in the database"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
     try:
@@ -1006,20 +1182,20 @@ def search_faces():
                 return jsonify({'success': False, 'message': 'Invalid image file'}), 400
             
             # Detect faces
-            boxes = face_model.detect_faces(img, confidence_threshold=0.3)
+            boxes = current_model.detect_faces(img, confidence_threshold=0.3)
             if boxes is None or len(boxes) == 0:
                 return jsonify({'success': False, 'message': 'No faces detected in image'}), 400
             
             # Process first detected face
             x1, y1, x2, y2 = map(int, boxes[0])
             face_crop = img[y1:y2, x1:x2]
-            embedding = face_model.get_embedding(face_crop)
+            embedding = current_model.get_embedding(face_crop)
             
             if embedding is None:
                 return jsonify({'success': False, 'message': 'Could not extract face embedding'}), 400
             
             # Search in Pinecone database
-            query_result = face_model.index.query(
+            query_result = current_model.index.query(
                 vector=embedding.tolist(),
                 top_k=top_k,
                 include_metadata=True
@@ -1063,15 +1239,16 @@ def search_faces():
 @app.route('/api/database-stats', methods=['GET'])
 def get_database_stats():
     """Get comprehensive database statistics"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
     try:
         # Get Pinecone stats
-        index_stats = face_model.index.describe_index_stats()
+        index_stats = current_model.index.describe_index_stats()
         
         # Get enrolled faces data
-        faces_data = face_model.get_enrolled_faces()
+        faces_data = current_model.get_enrolled_faces()
         
         # Calculate additional statistics
         faces = faces_data.get('faces', [])
@@ -1119,7 +1296,8 @@ def get_database_stats():
 @app.route('/api/bulk-delete-faces', methods=['POST'])
 def bulk_delete_faces():
     """Delete multiple faces from the database"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
     try:
@@ -1136,7 +1314,7 @@ def bulk_delete_faces():
         
         for face_id in face_ids:
             try:
-                if face_model.delete_face(face_id):
+                if current_model.delete_face(face_id):
                     deleted_count += 1
                     logger.info(f"Deleted face: {face_id}")
                 else:
@@ -1190,7 +1368,7 @@ def get_system_health():
         # Check model status
         model_status = {
             'face_model_loaded': face_model is not None,
-            'yolo_model_active': face_model.yolo_model is not None if face_model else False,
+            'yolo_model_active': current_model.yolo_model is not None if face_model else False,
             'pinecone_connected': True if face_model else False
         }
         
@@ -1218,7 +1396,7 @@ def get_system_health():
                 },
                 'file_counts': file_counts,
                 'performance': {
-                    'device': str(face_model.device) if face_model else 'Unknown',
+                    'device': str(current_model.device) if face_model else 'Unknown',
                     'model_type': 'YOLO8n + FaceNet' if face_model else 'Not loaded'
                 }
             }
@@ -1232,7 +1410,8 @@ def get_system_health():
 @app.route('/api/analytics', methods=['GET'])
 def get_analytics():
     """Get detailed analytics about processed files and faces"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
     try:
@@ -1245,7 +1424,7 @@ def get_analytics():
         total_upload_size = sum(f.stat().st_size for f in upload_files if f.is_file())
         
         # Get face database info
-        faces_info = face_model.get_enrolled_faces()
+        faces_info = current_model.get_enrolled_faces()
         
         return jsonify({
             'success': True,
@@ -1310,7 +1489,8 @@ def get_optimization_settings():
 @app.route('/api/face-database', methods=['GET'])
 def manage_face_database():
     """Advanced face database management"""
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         return jsonify({'success': False, 'message': 'Face recognition model not initialized'}), 500
     
     try:
@@ -1319,7 +1499,7 @@ def manage_face_database():
         return jsonify({
             'success': True,
             'database': {
-                'total_faces': face_model.get_enrolled_faces().get('total_faces', 0),
+                'total_faces': current_model.get_enrolled_faces().get('total_faces', 0),
                 'last_updated': datetime.now().isoformat(),
                 'features': [
                     'Duplicate face detection',
@@ -1411,7 +1591,7 @@ def export_data():
         
         if export_type == 'faces':
             # Export face database info
-            faces_info = face_model.get_enrolled_faces() if face_model else {'total_faces': 0}
+            faces_info = current_model.get_enrolled_faces() if face_model else {'total_faces': 0}
             
             export_data = {
                 'export_date': datetime.now().isoformat(),
@@ -1655,7 +1835,8 @@ if __name__ == '__main__':
     print("   - POST /api/optimize-settings: Smart Optimization")
     print("="*80)
     
-    if not face_model:
+    current_model = get_current_model()
+    if not current_model:
         print("⚠️  WARNING: Face recognition model not initialized!")
         print("   📌 Set PINECONE_API_KEY environment variable")
         print("   📌 Get your API key from: https://pinecone.io")
